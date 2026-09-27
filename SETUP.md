@@ -1,6 +1,6 @@
 # SVD recommender MCP tool
 
-This implementation trains one biased matrix factorization model (Funk SVD) on explicit ratings. It exposes MCP tools over stdio. It does not include an agent.
+This implementation trains one biased matrix factorization model (Funk SVD) on explicit ratings. It exposes MCP tools over stdio and includes a Gemini chat agent built with LangGraph.
 
 ## Setup (PowerShell, Python 3.11+)
 
@@ -31,6 +31,46 @@ To measure how closely the final 100%-trained artifact fits its own training rat
 ```
 
 Configure an MCP client with stdio command `D:\Projects\trustedAI-project\.venv\Scripts\python.exe`, arguments `-m`, `recommender.server`, and working directory `D:\Projects\trustedAI-project`.
+
+## Run the chat agent
+
+Create `.env` in the project root with these values:
+
+```dotenv
+GOOGLE_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-3.8-flash
+CHAT_HISTORY_MAX_MESSAGES=10
+```
+
+Only `GOOGLE_API_KEY` is required. The other two entries show the defaults and can be omitted. `.env` is ignored by Git; environment variables already set in the terminal take precedence. Start the interactive CLI:
+
+```powershell
+.venv\Scripts\python.exe -m recommender.chat_cli
+```
+
+Use `/exit` to quit. The agent discovers every tool exposed by the local MCP server when it starts and adds `read_session_memory` and `write_session_memory`. Gemini can save important facts, such as a MovieLens user ID, in memory for this CLI session. The memory is included in the system prompt on every turn, regardless of the chat history limit. It is kept only in process memory and disappears when the CLI exits. The agent needs the trained files in `artifacts/` before calling recommendation tools.
+
+Optional settings:
+
+- `GEMINI_MODEL` selects the Gemini model (default: `gemini-3.8-flash`).
+- `CHAT_HISTORY_MAX_MESSAGES` controls how many previous user and assistant messages are sent per turn (default: `10`; `0` sends none). The current query is always included.
+
+Python callers can supply their own conversation history:
+
+```python
+import asyncio
+from recommender.agent import SessionMemory, chat
+
+session_memory = SessionMemory()
+history = [
+    {"role": "user", "content": "Gợi ý phim cho user 1"},
+    {"role": "assistant", "content": "..."},
+]
+answer = asyncio.run(chat("Có phim hành động nào?", history, session_memory=session_memory))
+print(answer)
+```
+
+The caller stores and supplies history on each call. Pass the same `SessionMemory` object for subsequent turns in one chat session; create a new object for a new session. Calling `chat(query, history)` without one creates memory for that call only. For many turns in one process, use `async with MovieAgent() as agent:` and call `agent.chat(query, history)` to reuse both the MCP connection and session memory.
 
 `recommend_movies(user_id, limit=10, genre=None, min_ratings=5)` returns unseen movies ranked by predicted rating, with genres, number of observed ratings, and the user's top observed ratings. It does not claim that these examples caused the prediction. Movies without any training rating cannot be scored by this SVD model. The default minimum of 5 ratings reduces the weakest item estimates; pass `min_ratings=0` to include rated but very sparse movies.
 
