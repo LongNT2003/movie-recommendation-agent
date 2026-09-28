@@ -51,29 +51,75 @@ class Recommender:
             for user, group in self.user_history.items()
         }
 
-    def recommend(self, user_id: int, limit: int, genre: str | None, min_ratings: int) -> dict:
+    def recommend(self, user_id: int, limit: int, genre: str | None, min_ratings: int,
+                  include_genres: list[str] | None = None,
+                  exclude_genres: list[str] | None = None) -> dict:
         if limit < 1 or limit > 50:
             raise ValueError("limit must be between 1 and 50")
         if min_ratings < 0:
             raise ValueError("min_ratings must be non-negative")
         if user_id not in self.user_history:
             raise ValueError(f"Unknown user_id: {user_id}")
+        known_genres = {value.casefold(): value for genres in self.movie_lookup.genres
+                        for value in genres.split("|")}
+
+        def normalize_genres(values, field):
+            if values is None:
+                return []
+            if not isinstance(values, list):
+                raise ValueError(f"{field} must be a list of genre names")
+            normalized = []
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{field} must contain non-empty genre names")
+                key = value.strip().casefold()
+                if key not in known_genres:
+                    raise ValueError(f"Unknown genre: {value}. Valid genres: {', '.join(sorted(known_genres.values()))}")
+                canonical = known_genres[key]
+                if canonical not in normalized:
+                    normalized.append(canonical)
+            return normalized
+
+        included = normalize_genres(include_genres, "include_genres")
+        # Keep the original single-genre argument as an alias for inclusion.
+        if genre is not None:
+            included = normalize_genres([*included, genre], "genre")
+        excluded = normalize_genres(exclude_genres, "exclude_genres")
+        overlap = set(included) & set(excluded)
+        if overlap:
+            raise ValueError(f"Genres cannot be both included and excluded: {', '.join(sorted(overlap))}")
         seen = set(self.user_history[user_id].movieId.tolist())
         scores = self.model.scores_for_user(user_id)
         candidates = pd.DataFrame({"movieId": self.model.movie_ids, "predicted_rating": scores})
         candidates = candidates[~candidates.movieId.isin(seen)]
         candidates["rating_count"] = candidates.movieId.map(self.rating_counts).fillna(0).astype(int)
         candidates = candidates[candidates.rating_count >= min_ratings]
-        candidates = candidates.join(self.movie_lookup, on="movieId", how="inner")
-        if genre:
-            candidates = candidates[candidates.genres.str.split("|").map(lambda genres: genre.lower() in [g.lower() for g in genres])]
+        candidates = candidates.join(self.movie_lookup, on="movieId", how="inner").reset_index(drop=True)
+        if included or excluded:
+            include_set, exclude_set = set(included), set(excluded)
+            candidates = candidates[candidates.genres.str.split("|").map(
+                lambda genres: (not include_set or bool(include_set.intersection(genres)))
+                and not exclude_set.intersection(genres)
+            ).astype(bool)]
+        available_count = len(candidates)
         top = candidates.sort_values(["predicted_rating", "rating_count", "movieId"], ascending=[False, False, True]).head(limit)
         liked = self.user_history[user_id].head(5).join(self.movie_lookup, on="movieId")
         return {
             "user_id": user_id,
             "ranking_method": "SVD predicted rating; excludes movies already rated by this user",
-            "note": "Predictions are estimates, not explanations. liked_history contains observed ratings for grounded follow-up.",
-            "filters": {"genre": genre, "min_ratings": min_ratings},
+            "note": (
+                "Predictions are estimates, not explanations. liked_history contains observed ratings for grounded follow-up. "
+                "Genre constraints are hard filters applied before selecting the top results. "
+                "Chat preferences do not retrain the SVD model."
+                + (" Fewer movies satisfy the filters than requested; filters were not relaxed."
+                   if available_count < limit else "")
+            ),
+            "filters": {"genre": genre, "include_genres": included,
+                        "exclude_genres": excluded, "min_ratings": min_ratings},
+            "requested_limit": limit,
+            "returned_count": len(top),
+            "available_count": available_count,
+            "status": "ok" if available_count >= limit else "insufficient_candidates",
             "recommendations": [
                 {
                     "movie_id": int(row.movieId),
@@ -222,16 +268,25 @@ async def get_movie_info(titles: list[str]) -> dict:
 
 
 @mcp.tool()
-def recommend_movies(user_id: int, limit: int = 10, genre: str | None = None, min_ratings: int = 5) -> dict:
+def recommend_movies(user_id: int, limit: int = 10, genre: str | None = None, min_ratings: int = 5,
+                     include_genres: list[str] | None = None,
+                     exclude_genres: list[str] | None = None) -> dict:
     """Recommend unseen movies for a known MovieLens user using trained SVD ratings.
 
-    genre is an exact MovieLens genre (case-insensitive), e.g. Thriller or Sci-Fi.
-    Results include predicted scores, rating counts, and observed liked history.
+    Reuse the known user ID from history or session memory. include_genres requires
+    at least one listed genre; empty/omitted means unrestricted. exclude_genres
+    removes movies containing ANY listed genre, including mixed-genre movies.
+    Use exclude_genres=["Animation"] for "tired of animated movies". Genres are
+    case-insensitive MovieLens names, e.g. Thriller or Sci-Fi. Overlap is an error.
+    genre is a legacy single-genre alias merged into include_genres (OR matching).
+    All filters run before top-limit selection and are never relaxed automatically.
+    Results include predicted scores, applied filters, counts and observed history.
+    insufficient_candidates means fewer eligible movies than requested.
     """
     global _recommender
     if _recommender is None:
         _recommender = Recommender()
-    return _recommender.recommend(user_id, limit, genre, min_ratings)
+    return _recommender.recommend(user_id, limit, genre, min_ratings, include_genres, exclude_genres)
 
 
 @mcp.tool()

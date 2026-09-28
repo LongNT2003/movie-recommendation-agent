@@ -76,6 +76,38 @@ If correction fails, exact matches are preserved and unresolved inputs are marke
 `lookup_error` rather than being reported as confirmed misses. Exact-only calls need
 no API key. Searching plots by semantic description is not part of this tool.
 
+### Personalized recommendations with genre constraints
+
+For users present in the trained SVD model, `recommend_movies` accepts
+`include_genres` and `exclude_genres` as optional lists of MovieLens genre names.
+Names are trimmed, matched case-insensitively and deduplicated; unknown names and
+genres present in both lists are rejected.
+
+`include_genres` requires at least one listed genre (OR matching). An empty or
+omitted list imposes no inclusion requirement. `exclude_genres` removes every
+movie containing any excluded genre, including mixed-genre movies. The original
+`genre` parameter remains supported and is merged into `include_genres`.
+
+For "I liked Toy Story but I'm tired of animated movies", with a known user ID:
+
+```json
+{"user_id": 288, "limit": 5, "include_genres": [], "exclude_genres": ["Animation"]}
+```
+
+The tool excludes already-rated movies and applies genre and minimum-rating-count
+filters before selecting the top SVD scores. It returns canonical applied `filters`,
+`requested_limit`, `returned_count`, `available_count`, and `status`. If fewer movies
+qualify than requested, `status` is `insufficient_candidates`; constraints are never
+relaxed automatically, even when the result is empty.
+
+The agent reuses the user ID from history or session memory and carries constraints
+through clarifications of the same request. Temporary exclusions such as "tired of
+animation" are not saved as durable dislikes or applied to unrelated requests.
+Liking a movie does not imply a required genre. Chat preferences do not retrain SVD;
+recommendation explanations must distinguish predicted scores from observed history.
+Recommendations based on a seed movie for users outside the trained model are not
+implemented by this branch.
+
 ### Chat logs
 
 Each agent session writes two UTF-8 files with the same name:

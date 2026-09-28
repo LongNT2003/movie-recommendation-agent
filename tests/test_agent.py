@@ -101,7 +101,8 @@ class ScriptedGemini:
             tool_name = next(name for name in self.tool_names if name.endswith(suffix))
             return AIMessage(content="", tool_calls=[{
                 "name": tool_name,
-                "args": {"titles": ["Toy Story", "Jumanji"]} if self.movie_lookup else {"user_id": 1, "limit": 1},
+                "args": {"titles": ["Toy Story", "Jumanji"]} if self.movie_lookup else {
+                    "user_id": 1, "limit": 1, "include_genres": [], "exclude_genres": ["Animation"]},
                 "id": "call-1",
                 "type": "tool_call",
             }])
@@ -167,6 +168,11 @@ class AgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
             tool_messages = [message for message in model.calls[1] if isinstance(message, ToolMessage)]
             self.assertEqual(len(tool_messages), 1)
             self.assertIn("recommendations", str(tool_messages[0].content))
+            content = tool_messages[0].content
+            payload = json.loads(content if isinstance(content, str) else content[0]["text"])
+            self.assertEqual(payload["filters"]["exclude_genres"], ["Animation"])
+            self.assertEqual(len(payload["recommendations"]), 1)
+            self.assertNotIn("Animation", payload["recommendations"][0]["genres"])
 
     async def test_movie_lookup_through_real_mcp_and_agent_loop(self) -> None:
         model = ScriptedGemini(call_tool=True, movie_lookup=True)
