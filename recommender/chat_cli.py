@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 
-from recommender.agent import MovieAgent
+from recommender.agent import HistoryEntry, MovieAgent
 
 
 async def main() -> None:
-    history: list[dict] = []
+    history: list[HistoryEntry] = []
     async with MovieAgent() as agent:
         print("Movie agent ready. Type /exit to quit.")
+        print(f"Chat log: {agent.trace.readable_path}")
         while True:
             try:
                 query = input("You: ").strip()
@@ -27,10 +28,6 @@ async def main() -> None:
                 print(f"Error: {exc}")
                 continue
             print(f"Agent: {answer}")
-            history.extend((
-                {"role": "user", "content": query},
-                {"role": "assistant", "content": answer},
-            ))
 
 
 if __name__ == "__main__":

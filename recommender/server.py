@@ -12,6 +12,8 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
 from recommender.model import SVDModel
+from recommender.movie_search import MovieCatalog
+from recommender.trace import log_event, log_exception
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -143,6 +145,7 @@ class Recommender:
         if len(users) > 50 or sum(len(user.movie_ids) for user in users) > 1000:
             raise ValueError("Maximum 50 users and 1000 user/movie pairs per call")
         results = []
+        trained_movie_ids = set(self.model.movie_ids.tolist())
         for user in users:
             if user.user_id not in self.user_rating_maps:
                 raise ValueError(f"Unknown user_id: {user.user_id}")
@@ -152,24 +155,70 @@ class Recommender:
                 if movie_id not in self.movie_lookup.index:
                     raise ValueError(f"Unknown movie_id: {movie_id}")
                 movie = self.movie_lookup.loc[movie_id]
-                movie_results.append({
+                observed_rating = user_ratings.get(movie_id)
+                if observed_rating is not None:
+                    rating = float(observed_rating)
+                    rating_source = "observed"
+                elif movie_id in trained_movie_ids:
+                    rating = round(self.model.predict(user.user_id, movie_id), 3)
+                    rating_source = "predicted"
+                else:
+                    rating = None
+                    rating_source = "unavailable"
+                result = {
                     "movie_id": movie_id,
                     "title": movie.title,
                     "year": int(movie.year),
-                    "rating": user_ratings.get(movie_id),
-                })
+                    "rating": rating,
+                    "rating_source": rating_source,
+                }
+                if rating_source == "unavailable":
+                    result["reason"] = "Movie has no training ratings; SVD cannot predict its score."
+                movie_results.append(result)
             results.append({
                 "user_id": user.user_id,
-                "rated_count": sum(movie["rating"] is not None for movie in movie_results),
+                "rated_count": sum(movie["rating_source"] == "observed" for movie in movie_results),
+                "predicted_count": sum(movie["rating_source"] == "predicted" for movie in movie_results),
+                "unavailable_count": sum(movie["rating_source"] == "unavailable" for movie in movie_results),
                 "movies": movie_results,
             })
         return {
-            "note": "Ratings are observed values from ratings.csv; null means this user has not rated that movie.",
+            "note": (
+                "rating_source=observed means the user actually rated the movie in ratings.csv. "
+                "rating_source=predicted means the user has not rated it and rating is an SVD "
+                "estimate on the 0.5–5 scale, not an observed rating. rating_source=unavailable "
+                "has rating=null because the movie has no training ratings. rated_count counts "
+                "only observed ratings. Always distinguish observed ratings from predictions."
+            ),
             "users": results,
         }
 
 
 _recommender: Recommender | None = None
+_movie_catalog: MovieCatalog | None = None
+
+
+@mcp.tool()
+async def get_movie_info(titles: list[str]) -> dict:
+    """Get CSV movie details, including plots, for 1 to 20 user-supplied titles.
+
+    Searches normalized exact titles first. For misses, internally asks Gemini for
+    up to 10 corrected titles per input in one pass, then searches exact again.
+    Status is exact, guessed, ambiguous, not_found or lookup_error per input.
+    Disclose guessed matches; ask the user to select ambiguous matches; report misses.
+    Pass original titles, not agent-generated guesses. No trained model is required.
+    """
+    global _movie_catalog
+    if _movie_catalog is None:
+        csv_path = DATA_DIR / "movies_with_plots.csv"
+        log_event("search.csv.load.start", path=str(csv_path))
+        try:
+            _movie_catalog = MovieCatalog(csv_path)
+        except Exception as exc:
+            log_exception("search.csv.load.error", exc)
+            raise
+        log_event("search.csv.load.end", path=str(csv_path))
+    return await _movie_catalog.search(titles)
 
 
 @mcp.tool()
@@ -200,10 +249,13 @@ def find_similar_users(user_id: int, limit: int = 10) -> dict:
 
 @mcp.tool()
 def find_ratings(users: list[UserMovieQuery]) -> dict:
-    """Look up observed ratings for each requested user and their movie IDs.
+    """Get actual ratings, or SVD predictions for movies a user has not rated.
 
     Pass users=[{"user_id": 1, "movie_ids": [296, 1]}, ...]. Results preserve
-    input order; rating is null when a user has not rated a known movie.
+    input order. Each rating_source is observed (actually rated), predicted (SVD
+    estimate), or unavailable (no training ratings for the movie, rating=null).
+    Use this to assess whether a user might like a specific movie. Disclose predictions
+    as estimates. rated_count includes observed ratings only. Use database movie IDs.
     """
     global _recommender
     if _recommender is None:
