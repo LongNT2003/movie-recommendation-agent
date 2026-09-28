@@ -1,0 +1,116 @@
+======================================================================
+1. Problem Analysis
+======================================================================
+
+1.1 Who are the users of this system? What do they need?
+Người dùng ứng dụng hoặc người chuẩn bị dùng ứng dụng, nhu cầu của họ là tìm những bộ phim mới, phim hay mà có thể phù hợp với họ (trong phạm vi những bộ phim có trên ứng dụng). Đối với người dùng mới, họ muốn tìm hiểu về ứng dụng có thể có những bộ phim nào hay để bắt đầu.
+
+How does the system receive the user ID and use rating history?
+nhận user ID thông qua đoạn chat, có thể phát triển thêm tự nhận user ID theo tài khoản đã login. rating history được sử dụng để train mô hình gợi ý phim và tra cứu lịch sử rating
+
+1.2 What makes a good movie recommendation in a conversational setting?
+My criteria: một đề xuất tốt là đề xuất dựa trên mô hình đã train trên tập dữ liệu, có bằng chứng đầy đủ, rõ ràng để user biết là bộ phim mới này nên xem. Tạo sự tin tưởng cho hệ thống.
+
+1.3 What are the key technical challenges in this problem?
+The main challenges in my approach: 
+a. agent có thể quên userID hoặc các thông tin quan trọng nếu cuộc trò chuyện quá dài
+b. người dùng có thể nhập sai tên phim -> không truy vấn được thông tin phim 
+c. chưa triển khai được database để đa dạng truy vấn do không đủ thời gian
+d. agent có thể trả lời thông tin ngoài dữ liệu đang có -> ví dụ movie không có trong ứng dụng
+
+
+======================================================================
+2. Approach
+======================================================================
+
+2.1 How did you break down the problem?
+
+Tôi tách hệ thống thành ba lớp: mô hình gợi ý học từ ratings, các tool tra cứu dữ liệu, và agent hội thoại điều phối các tool. 
+
+Implemented components:
+- Mô hình biased matrix factorization (Funk SVD), học bằng stochastic gradient descent từ ratings.csv; lưu model và metadata để sử dụng khi chạy ứng dụng.
+- MCP server qua stdio với bốn tool: recommend_movies, find_similar_users, find_ratings và get_movie_info.
+- Agent LangGraph dùng Gemini để phân tích yêu cầu, chọn tool, đọc kết quả và tạo câu trả lời. Graph có nút model, nút tools và nhánh lặp từ tools về model cho đến khi có câu trả lời cuối.
+- Lịch sử hội thoại có giới hạn cấu hình bằng CHAT_HISTORY_MAX_MESSAGES, kèm các tool call/result của lượt được giữ lại; memory riêng của session có hai tool read_session_memory và write_session_memory.
+
+Request processing flow:
+1. Nhận query cùng lịch sử. Tạo system prompt với memory hiện tại và chọn phần lịch sử còn trong giới hạn. Nếu thiếu user ID cho yêu cầu cá nhân hóa, agent được hướng dẫn hỏi lại; ID do người dùng cung cấp được lưu vào memory của session.
+2. Gemini phân tích yêu cầu và gọi tool phù hợp. Danh sách tool dữ liệu được khám phá từ MCP server lúc khởi tạo.
+3. Với yêu cầu gợi ý phim, recommend_movies lấy user factor đã học, tính điểm cho các phim model biết, loại phim người dùng đã rating và áp dụng các bộ lọc trước khi chọn top kết quả.
+4. Với tên phim do người dùng nhập, get_movie_info xác minh tên và trả movie_id cùng dữ liệu từ CSV. Những tool phụ thuộc movie_id phải đợi bước xác minh này; agent không tự đoán ID.
+5. Kết quả tool quay lại Gemini. Agent có thể gọi tiếp tool để lấy dữ liệu còn thiếu, rồi tổng hợp câu trả lời trong phạm vi dữ liệu đã xác minh. Memory trong prompt được cập nhật sau khi tool ghi thông tin.
+6. Khi lượt hỏi thành công, lưu cả user message, assistant tool calls, ToolMessages và câu trả lời cuối vào lịch sử để dùng ở lượt sau.
+
+How are follow-up questions handled, such as “Why would I like that?”?
+Agent dùng lại movie_id và dữ liệu đã xác minh trong ToolMessages còn được giữ, thay vì lấy ID từ đoạn văn do assistant viết. recommend_movies trả kèm tối đa năm phim có rating cao nhất của người dùng làm dữ liệu tham chiếu; nếu cần plot của phim được gợi ý thì gọi get_movie_info. Phần giải thích chỉ đối chiếu ratings, genres và plot thực sự có trong kết quả tool. Điểm SVD là dự đoán, không chứng minh nguyên nhân người dùng sẽ thích phim. Nếu bằng chứng đã bị cắt khỏi lịch sử, agent cần tra cứu lại.
+
+2.2 What methods and tools did you choose? Why?
+
+Tools available to the agent:
+- recommend_movies: Gợi ý phim chưa được user rating, xếp theo điểm SVD và lọc thể loại.
+- find_similar_users: Tìm users có user factors tương tự, kèm thông tin rating chung.
+- find_ratings: Tra rating thực tế hoặc dự đoán SVD cho các cặp user/phim, có nhãn nguồn điểm.
+- get_movie_info: Xác minh tên phim, hỗ trợ sửa tên và lấy thông tin/plot từ CSV.
+- read_session_memory: Đọc thông tin quan trọng đã lưu trong phiên chat.
+- write_session_memory: Ghi hoặc cập nhật user ID, sở thích bền vững của phiên.
+Bốn tool đầu được cung cấp qua MCP server; hai tool memory được tạo trực tiếp trong agent.
+
+Data processing and preference profiles from ratings / genres:
+Tôi dùng pandas đọc ratings.csv và movies_with_plots.csv, nối thông tin qua userId/movieId và kiểm tra rating trùng trước khi train. SVD học user factors, movie factors và biases từ ratings để cá nhân hóa điểm dự đoán trên thang 0.5–5. Genres dùng để lọc và giải thích; sở thích trong chat được lưu vào session memory nhưng không cập nhật mô hình. Dữ liệu được truy vấn trong RAM, chưa triển khai SQL/database.
+
+Finding similar users:
+find_similar_users xếp hạng bằng cosine similarity giữa user factors, kèm số phim chung và độ lệch rating trên các phim chung. Chưa có ngưỡng số phim chung tối thiểu, nên similarity chỉ là ước lượng; cần tra rating thực tế trước khi kết luận về ý kiến của họ.
+
+Movie lookup:
+get_movie_info tìm tên đã chuẩn hóa trong CSV. Nếu chưa khớp, Gemini sửa tên trong một lượt, tối đa 10 ứng viên mỗi đầu vào, rồi tool tra exact lại. Agent thông báo tên đã sửa, hỏi lại khi mơ hồ và phân biệt không tìm thấy với lỗi tra cứu. Plot lấy từ CSV để giải thích; chưa dùng tìm kiếm plot theo ngữ nghĩa hay tags để xếp hạng.
+
+Ranking and constraint filtering:
+recommend_movies loại phim user đã rating, áp dụng min_ratings và bộ lọc genres trước khi lấy top điểm SVD. include_genres khớp ít nhất một thể loại; exclude_genres loại phim chứa bất kỳ thể loại bị loại nào. Ví dụ “chán phim hoạt hình” dùng exclude_genres=['Animation']. Nếu không đủ ứng viên, hệ thống báo thiếu và không tự nới bộ lọc.
+
+Handling limited or missing data:
+- Phim ít ratings: mặc định min_ratings=5; phim không có rating train không được SVD dự đoán.
+- User ít lịch sử: vẫn dùng SVD, chưa có fallback riêng. User ngoài tập train chưa được cá nhân hóa.
+- Phim không xác minh được: báo giới hạn dữ liệu, không bổ sung thông tin từ kiến thức LLM.
+
+The LLM and evidence-based explanations:
+Gemini chọn tool và tổng hợp câu trả lời. Prompt yêu cầu chỉ dùng thông tin phim từ tool và phân biệt rating observed, predicted, unavailable. 
+
+2.3 Example of combining multiple sources of information
+
+User 1 hỏi: “What do people with similar taste to mine think about Pulp Fiction?”
+
+Luồng tra cứu: get_movie_info xác minh Pulp Fiction (1994), movie_id=296; find_similar_users lấy 10 users gần nhất; find_ratings lấy rating của họ cho phim này.
+
+Kiểm tra trực tiếp bằng code cho thấy 5/10 users có rating observed: 3, 5, 4, 4 và 1, trung bình 3.4/5. Năm users còn lại chỉ có điểm predicted, phải trình bày riêng và không tính như ý kiến thực tế. Nếu không có rating observed, agent cần nêu thiếu bằng chứng. Đây là ví dụ kiểm tra dữ liệu, chưa phải transcript Gemini; phần tổng hợp hiện do LLM thực hiện.
+
+
+2.5 Decision Log — 3 key decisions
+
+Decision 1 — model recommendation SVD để cá nhân hóa
+- Alternative considered: embedd movie thành các vector để khi gợi ý , truy vấn các movie có độ tương đồng với lịch sử movie của user
+- Why I chose this: Học sở thích từ ratings và dự đoán movie mà user đánh giá cao để gợi ý và dùng latent factors để tìm user có sở thích tương tự.
+- Trade-offs: Chưa dùng plot/tags trong ranking; không xử lý user mới hoặc phim chưa có rating train.
+
+Decision 2 — Xác minh phim bằng tool get_movie_info
+- Alternative considered: sử dụng các thuật toán tính độ tương đồng dựa trên độ trùng khớp các kí tự.
+- Why I chose this: Hạn chế trả lời về phim ngoài ứng dụng; để gemini sửa tên phim và tra cứu lại giúp xử lí các trường hợp edge case dễ. Và quan trọng nhất là tạo cảm giá thoải mái khi sử dụng cho user.
+- Trade-offs: Tăng chi phí API, độ trễ
+
+Decision 3 — Lưu lịch sử chat và memory theo session
+- Alternative considered: Chỉ giữ tin nhắn gần nhất hoặc gửi toàn bộ hội thoại mỗi lượt.
+- Why I chose this: Giữ user ID và thông tin quan trọng khi lịch sử dài, đồng thời giữ tool results cho câu hỏi tiếp nối, giảm context length.
+- Trade-offs: phụ thuộc vào LLM để quyết định thông tin nào là quan trọng (ngoại từ user ID vì đã quy định trong prompt).
+
+======================================================================
+3. Failure Analysis
+======================================================================
+
+3.1 Case 1 — Blind-spot analysis
+
+- User ID and question: User 1 — “What's my blind spot? What genres am I missing?”
+-> ý tưởng: chưa làm giàu thông tin mỗi user, để xử lí cần trích xuất các thể loại user đã xem -> lọc filter rồi chạy model SVD recommend 
+
+3.2 Case 2 — A dark psychological thriller with a twist
+
+-> Ý tưởng: cần làm giàu thông tin như thêm cột twist level, hiện chưa có cách để đánh giá một bộ phim có twist mạnh hay nhẹ
+
